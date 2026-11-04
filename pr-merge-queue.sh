@@ -5,7 +5,9 @@
 # Every POLL_INTERVAL seconds:
 #   - finds your open PRs in the org
 #   - if a PR is ready (see below) and auto-merge isn't on yet, enables it (squash),
-#     pinned to the head commit it checked
+#     pinned to the head commit it checked. If GitHub already reports the PR as
+#     mergeable (mergeStateStatus CLEAN), it merges it straight away instead, since
+#     GitHub won't enable auto-merge on a PR that has nothing left to wait for
 #   - if a PR has auto-merge on but has since become blocked, disables it
 #   - if a PR has auto-merge on and is behind main, updates the branch
 #
@@ -178,6 +180,15 @@ def plural($n; $word): "\($n) \($word)\(if $n == 1 then "" else "s" end)";
   )
 JQ
 
+# Merges a PR straight away, pinned to the head commit that was checked.
+# Without --admin this still can't get past branch protection.
+merge_now() {
+  local label="$1" number="$2" repo="$3" head="$4" out
+  if ! out=$(gh pr merge "$number" -R "$repo" --"$MERGE_METHOD" --match-head-commit "$head" 2>&1); then
+    log "$label: ERROR merging: $out"
+  fi
+}
+
 run_once() {
   local me pages prs
   if ! me=$(gh api user --jq .login 2>&1); then
@@ -247,13 +258,31 @@ run_once() {
       continue
     fi
 
+    # GitHub refuses to enable auto-merge on a PR that can already be merged
+    # (mergeStateStatus CLEAN), so merge those directly.
+    if [[ "$merge_state" == "CLEAN" ]]; then
+      if [[ "$DRY_RUN" == "true" ]]; then
+        log "$label: [DRY-RUN] would merge now ($MERGE_METHOD) at ${head:0:7}, approved by $approvers - $title"
+        continue
+      fi
+      log "$label: ready and mergeable, approved by $approvers, merging ($MERGE_METHOD) at ${head:0:7} - $title"
+      merge_now "$label" "$number" "$repo" "$head"
+      continue
+    fi
+
     if [[ "$DRY_RUN" == "true" ]]; then
       log "$label: [DRY-RUN] would enable auto-merge ($MERGE_METHOD) at ${head:0:7}, approved by $approvers - $title"
       continue
     fi
     log "$label: ready, approved by $approvers, enabling auto-merge ($MERGE_METHOD) at ${head:0:7} - $title"
     if ! out=$(gh pr merge "$number" -R "$repo" --auto --"$MERGE_METHOD" --match-head-commit "$head" 2>&1); then
-      log "$label: ERROR enabling auto-merge: $out"
+      if [[ "$out" == *"clean status"* ]]; then
+        # Became mergeable between the query and this call.
+        log "$label: already mergeable, merging ($MERGE_METHOD) at ${head:0:7}"
+        merge_now "$label" "$number" "$repo" "$head"
+      else
+        log "$label: ERROR enabling auto-merge: $out"
+      fi
     fi
   done
 }
